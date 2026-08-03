@@ -78,18 +78,13 @@ const state = {
   loaded: false,
   workerSignatureCache: {},
   // Kiosk state
-  kioskPhase: null,
+  kioskPhase: null,          // 'worker' ou 'deliverer'
   pendingDelivery: null,
   pendingWorkerSig: null,
   pendingDelivererSig: null,
   pendingNoSignWorker: false,
   pendingNoSignDeliverer: false,
-  currentPad: null,
-  // Audit filters
-  auditFilters: { workerId: "todos", estado: "todos" },
-  // Login state
-  loginUser: USERS[0],
-  pin: ""
+  currentPad: null,          // instância do signature pad ativo
 };
 
 // ─── Firestore helpers ───────────────────────────────────────────────────────
@@ -108,20 +103,10 @@ function defaultData() {
   const past = new Date(); past.setMonth(past.getMonth() - 13);
   const soon = new Date(); soon.setDate(soon.getDate() + 42);
   const seedEvents = [
-    makeEventRaw(worker, MATRIZ_INICIAL[6], 1, past.toISOString().slice(0, 10), "ATIVO", "Jorge", "", 0),
-    makeEventRaw(worker, MATRIZ_INICIAL[12], 2, soon.toISOString().slice(0, 10), "ATIVO", "Técnico Sul", "", 0)
+    makeEventRaw(worker, MATRIZ_INICIAL[6], 1, past.toISOString().slice(0, 10), "ATIVO", "Jorge"),
+    makeEventRaw(worker, MATRIZ_INICIAL[12], 2, soon.toISOString().slice(0, 10), "ATIVO", "Técnico Sul")
   ];
-  const precos = {};
-  MATRIZ_INICIAL.forEach(epi => { precos[epi.nome] = 0; });
-  return {
-    matriz: MATRIZ_INICIAL,
-    trabalhadores: [worker],
-    eventos: seedEvents,
-    stocks,
-    budget: { limit: 0, items: {} },
-    operadores: [],
-    precos
-  };
+  return { matriz: MATRIZ_INICIAL, trabalhadores: [worker], eventos: seedEvents, stocks, budget: { limit: 0, items: {} }, operadores: [] };
 }
 
 async function loadFromFirestore() {
@@ -210,18 +195,11 @@ function ensureDataShape() {
   if (!state.data.eventos) state.data.eventos = [];
   if (!state.data.latestSignatures) state.data.latestSignatures = {};
   if (!state.data.stocks) state.data.stocks = {};
-  if (!state.data.precos) {
-    state.data.precos = {};
-    state.data.matriz.forEach(epi => { state.data.precos[epi.nome] = 0; });
-  }
   WAREHOUSES.forEach(w => {
     if (!state.data.stocks[w]) state.data.stocks[w] = {};
     state.data.matriz.forEach(epi => {
       state.data.stocks[w][epi.nome] = normalizeStockRecord(state.data.stocks[w][epi.nome]);
     });
-  });
-  state.data.matriz.forEach(epi => {
-    if (!(epi.nome in state.data.precos)) state.data.precos[epi.nome] = 0;
   });
 }
 
@@ -385,7 +363,7 @@ function uid(prefix = "EVT") {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
-function makeEventRaw(worker, epi, qtd, validade, statusAlerta, responsavel, tamanho = "", preco = 0) {
+function makeEventRaw(worker, epi, qtd, validade, statusAlerta, responsavel, tamanho = "") {
   return {
     id: uid(),
     idTrab: worker.id,
@@ -398,8 +376,7 @@ function makeEventRaw(worker, epi, qtd, validade, statusAlerta, responsavel, tam
     estado: statusAlerta === "ATIVO" ? "Entregue" : "Baixa",
     statusAlerta,
     validade,
-    responsavel,
-    preco_unitario: Number(preco || 0)
+    responsavel
   };
 }
 
@@ -454,46 +431,12 @@ function initials(name) {
   return name.split(/\s+/).slice(0, 2).map(p => p[0]).join("").toUpperCase();
 }
 
-// ─── Cálculo de gastos ──────────────────────────────────────────────────────
-function calcularGastos() {
-  const eventos = state.data.eventos.filter(e => e.tipo === "ENTREGA");
-  const gastosPorEpi = {};
-  const gastosPorTrabalhador = {};
-  let totalGasto = 0;
-
-  eventos.forEach(e => {
-    const qtd = Number(e.qtd || 0);
-    const preco = Number(e.preco_unitario || 0);
-    const custo = qtd * preco;
-    if (custo === 0) return;
-
-    totalGasto += custo;
-    gastosPorEpi[e.epi] = (gastosPorEpi[e.epi] || 0) + custo;
-    const worker = state.data.trabalhadores.find(w => w.id === e.idTrab);
-    if (worker) {
-      const nome = worker.nome;
-      gastosPorTrabalhador[nome] = (gastosPorTrabalhador[nome] || 0) + custo;
-    }
-  });
-
-  return { totalGasto, gastosPorEpi, gastosPorTrabalhador };
-}
-
 // ─── Render principal ────────────────────────────────────────────────────────
 function render() {
   if (!state.user) return renderLogin();
   if (!isSuper() && !state.operadorAtual) return renderOperadorPicker();
   if (state.selectedWorkerId) return renderWorkerDetail();
-
-  const views = {
-    home: renderHome,
-    people: renderPeople,
-    stock: renderStock,
-    alerts: renderAlerts,
-    audit: renderAudit,
-    budget: renderBudgetPage
-  };
-
+  const views = { home: renderHome, people: renderPeople, stock: renderStock, alerts: renderAlerts, audit: renderAudit };
   appEl.innerHTML = `
     <main>
       <div class="app-top">
@@ -513,15 +456,7 @@ function render() {
 }
 
 function pageTitle() {
-  const titles = {
-    home: "Início",
-    people: "Pessoal",
-    stock: "Armazém",
-    alerts: "Alertas",
-    audit: "Auditoria",
-    budget: "Orçamento"
-  };
-  return titles[state.page] || "Início";
+  return { home: "Início", people: "Pessoal", stock: "Armazém", alerts: "Alertas", audit: "Auditoria" }[state.page];
 }
 
 function renderOperadorPicker() {
@@ -554,7 +489,6 @@ function renderOperadorPicker() {
 function renderLogin() {
   const selected = state.loginUser || USERS[0];
   state.loginUser = selected;
-  // Limpar PIN se o utilizador mudar? Não, mantemos.
   appEl.innerHTML = `
     <section class="login-shell">
       <div class="brand">
@@ -593,9 +527,6 @@ function bottomNav() {
     ["alerts", iconBell(), "Alertas"],
     ["audit", iconAudit(), "Auditoria"]
   ];
-  if (isSuper()) {
-    items.push(["budget", iconBudget(), "Orçamento"]);
-  }
   return `<nav class="bottom-nav">${items.map(([id, icon, label]) => `
     <button class="nav-btn ${state.page === id ? "active" : ""}" data-page="${id}">
       ${id === "alerts" && count ? `<span class="nav-badge">${count}</span>` : ""}
@@ -604,7 +535,6 @@ function bottomNav() {
   `).join("")}</nav>`;
 }
 
-// ─── Página Inicial (sem orçamento) ──────────────────────────────────────
 function renderHome() {
   const workers = scopedWorkers();
   const workerIds = new Set(workers.map(w => w.id));
@@ -622,6 +552,7 @@ function renderHome() {
         <div class="kpi"><span>A Expirar</span><strong>${warning.length}</strong></div>
       </div>
     </section>
+    ${renderBudgetCard()}
     ${isSuper() ? renderStockMatrix() : ""}
     <section class="section">
       <div class="section-head"><h2>Ações Rápidas</h2></div>
@@ -640,6 +571,43 @@ function renderHome() {
       </div>
     </section>
   `;
+}
+
+function renderBudgetCard() {
+  const totals = budgetTotals();
+  const usedItems = Object.entries(state.data.budget.items || {})
+    .filter(([, item]) => Number(item.planned || 0) || Number(item.spent || 0))
+    .slice(0, 4);
+  return `
+    <section class="section">
+      <div class="section-head"><h2>Orçamento de Segurança</h2><button class="ghost-btn" data-modal="budget">Editar</button></div>
+      <div class="budget-card">
+        <div class="budget-row">
+          <div><span>Limite Geral</span><strong>${money(totals.limit)}</strong></div>
+          <div><span>Previsto EPIs</span><strong>${money(totals.planned)}</strong></div>
+          <div><span>Gasto EPIs</span><strong>${money(totals.spent)}</strong></div>
+        </div>
+        <div class="progress" aria-label="${totals.pct}% utilizado"><span style="width:${totals.pct}%"></span></div>
+        <p class="meta">${totals.pct}% utilizado · Restante ${money(totals.remaining)}</p>
+        ${usedItems.length ? `<div class="budget-mini-list">${usedItems.map(([name, item]) => `
+          <div><span>${html(name)}</span><strong>${money(Number(item.spent || 0))} / ${money(Number(item.planned || 0))}</strong></div>
+        `).join("")}</div>` : ""}
+      </div>
+    </section>
+  `;
+}
+
+function money(value) {
+  return new Intl.NumberFormat("pt-PT", { style: "currency", currency: "EUR", maximumFractionDigits: 0 }).format(value);
+}
+
+function epiLabel(event) {
+  return `${event.epi}${event.tamanho ? ` · Tam. ${event.tamanho}` : ""}`;
+}
+
+function epiRiscos(event) {
+  if (event.tipo === "AUDITORIA_GLOBAL") return "—";
+  return state.data.matriz.find(m => m.nome === event.epi)?.riscos || "";
 }
 
 function renderStockMatrix() {
@@ -661,168 +629,176 @@ function renderStockMatrix() {
   `;
 }
 
-// ─── Página Orçamento ──────────────────────────────────────────────────────
-function renderBudgetPage() {
-  const precos = state.data.precos || {};
-  const budget = state.data.budget || { limit: 0 };
-  const gastos = calcularGastos();
-  const totalGasto = gastos.totalGasto;
-  const limit = Number(budget.limit || 0);
-  const restante = Math.max(0, limit - totalGasto);
-  const pct = limit ? Math.min(100, Math.round((totalGasto / limit) * 100)) : 0;
-
-  const rows = state.data.matriz.map(epi => {
-    const preco = precos[epi.nome] || 0;
-    const gastoEpi = gastos.gastosPorEpi[epi.nome] || 0;
-    const qtdEntregue = state.data.eventos
-      .filter(e => e.tipo === "ENTREGA" && e.epi === epi.nome)
-      .reduce((sum, e) => sum + Number(e.qtd || 0), 0);
-    return `
-      <tr>
-        <td>${html(epi.nome)}</td>
-        <td><input class="input preco-input" data-epi="${html(epi.nome)}" type="number" step="0.01" min="0" value="${preco}" style="max-width:100px"></td>
-        <td class="mono">${money(gastoEpi)}</td>
-        <td class="mono">${qtdEntregue}</td>
-      </tr>
-    `;
-  }).join("");
-
-  const workerRows = Object.entries(gastos.gastosPorTrabalhador)
-    .sort((a, b) => b[1] - a[1])
-    .map(([nome, valor]) => `
-      <tr><td>${html(nome)}</td><td class="mono">${money(valor)}</td></tr>
-    `).join("") || `<tr><td colspan="2">Sem gastos registados.</td></tr>`;
-
+function renderPeople() {
+  const delegacoes = isSuper() ? ["TODAS", ...WAREHOUSES] : [state.user.armazem];
+  const q = state.filters.workerSearch.toLowerCase();
+  const workers = scopedWorkers().filter(w =>
+    (state.filters.delegacao === "TODAS" || w.delegacao === state.filters.delegacao) &&
+    `${w.nome} ${w.funcao}`.toLowerCase().includes(q)
+  );
   return `
     <section class="section">
-      <div class="section-head"><h2>Orçamento Geral</h2></div>
-      <div class="field-row" style="max-width:300px">
-        <label>Limite anual (€)</label>
-        <input class="input" id="budget-limit" type="number" step="1" min="0" value="${limit}">
-        <button class="primary-btn" id="save-budget-limit">Guardar Limite</button>
-      </div>
-      <div class="kpi-grid" style="grid-template-columns: repeat(3,1fr);">
-        <div class="kpi"><span>Limite</span><strong>${money(limit)}</strong></div>
-        <div class="kpi"><span>Gasto total</span><strong>${money(totalGasto)}</strong></div>
-        <div class="kpi"><span>Restante</span><strong>${money(restante)}</strong></div>
-      </div>
-      <div class="progress" style="margin:10px 0" aria-label="${pct}% utilizado"><span style="width:${pct}%"></span></div>
-      <p class="meta">${pct}% utilizado · ${money(restante)} disponível</p>
-    </section>
-
-    <section class="section">
-      <div class="section-head"><h2>Preços Unitários por EPI</h2></div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>EPI</th><th>Preço (€)</th><th>Gasto total (€)</th><th>Quantidade entregue</th></tr></thead>
-          <tbody>${rows}</tbody>
-        </table>
-      </div>
-      <button class="primary-btn" id="save-precos">Guardar Preços</button>
-    </section>
-
-    <section class="section">
-      <div class="section-head"><h2>Gasto por Trabalhador</h2></div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Trabalhador</th><th>Total gasto (€)</th></tr></thead>
-          <tbody>${workerRows}</tbody>
-        </table>
-      </div>
-    </section>
-  `;
-}
-
-function money(value) {
-  return new Intl.NumberFormat("pt-PT", { style: "currency", currency: "EUR", maximumFractionDigits: 2 }).format(value);
-}
-
-// ─── Página Auditoria (melhorada) ──────────────────────────────────────────
-function renderAudit() {
-  const rows = auditRows();
-  const workerFilter = state.auditFilters.workerId || "todos";
-  const estadoFilter = state.auditFilters.estado || "todos";
-
-  let filtered = rows;
-  if (workerFilter !== "todos") {
-    filtered = filtered.filter(r => r.idTrab === Number(workerFilter));
-  }
-  if (estadoFilter !== "todos") {
-    filtered = filtered.filter(r => {
-      const status = r.statusAlerta === "ATIVO" ? eventStatus(r) : "inativo";
-      if (estadoFilter === "valido") return status === "normal";
-      if (estadoFilter === "expirado") return status === "expired";
-      if (estadoFilter === "aexpirar") return status === "warning";
-      if (estadoFilter === "inativo") return r.statusAlerta !== "ATIVO";
-      return true;
-    });
-  }
-
-  const s = auditSummary(rows);
-  const conformidade = s.ativos.length ? Math.round((s.validos.length / s.ativos.length) * 100) : 100;
-  const gastos = calcularGastos();
-
-  const workerOptions = scopedWorkers().map(w =>
-    `<option value="${w.id}" ${Number(workerFilter) === w.id ? "selected" : ""}>${html(w.nome)}</option>`
-  ).join("");
-
-  return `
-    <section class="section">
-      <div class="section-head"><h2>Estado de Conformidade</h2></div>
-      <div class="kpi-grid">
-        <div class="kpi"><span>Entregas ativas</span><strong>${s.ativos.length}</strong></div>
-        <div class="kpi"><span>Válidas</span><strong>${s.validos.length}</strong></div>
-        <div class="kpi"><span>A expirar (≤90 dias)</span><strong>${s.aExpirar.length}</strong></div>
-        <div class="kpi"><span>Expiradas</span><strong>${s.expirados.length}</strong></div>
-        <div class="kpi"><span>Sem assinatura</span><strong>${s.semAssinatura.length}</strong></div>
-        <div class="kpi"><span>Trabalhadores sem entregas</span><strong>${s.semNenhumaEntrega.length}</strong></div>
-        <div class="kpi"><span>Gasto total (€)</span><strong>${money(gastos.totalGasto)}</strong></div>
-      </div>
-      <p class="meta">Taxa de conformidade: <strong>${conformidade}%</strong>.
-        As assinaturas e o registo completo de cada entrega ficam gravados de forma imutável na coleção
-        <span class="mono">deliveries</span> do Firestore.</p>
-      <button class="primary-btn" data-action="exportAuditCsv">↓ Exportar Auditoria (CSV)</button>
-    </section>
-
-    ${s.semNenhumaEntrega.length ? `
-    <section class="section">
-      <div class="section-head"><h2>Trabalhadores sem qualquer entrega</h2><span class="badge danger">${s.semNenhumaEntrega.length}</span></div>
-      <div class="alert-list">${s.semNenhumaEntrega.map(w => `
-        <div class="alert-card"><div><strong>${html(w.nome)}</strong><span class="meta">${html(w.funcao)} · ${html(w.delegacao)}</span></div></div>
-      `).join("")}</div>
-    </section>` : ""}
-
-    <section class="section">
-      <div class="section-head"><h2>Filtros</h2></div>
       <div class="field-row two">
-        <select class="select" data-audit-filter="workerId">
-          <option value="todos">Todos os trabalhadores</option>
-          ${workerOptions}
-        </select>
-        <select class="select" data-audit-filter="estado">
-          <option value="todos">Todos os estados</option>
-          <option value="valido" ${estadoFilter === "valido" ? "selected" : ""}>Válido</option>
-          <option value="aexpirar" ${estadoFilter === "aexpirar" ? "selected" : ""}>A expirar</option>
-          <option value="expirado" ${estadoFilter === "expirado" ? "selected" : ""}>Expirado</option>
-          <option value="inativo" ${estadoFilter === "inativo" ? "selected" : ""}>Inativo (substituído)</option>
+        <input class="input" data-filter="workerSearch" placeholder="Pesquisar por nome ou função" value="${html(state.filters.workerSearch)}">
+        <select class="select" data-filter="delegacao" ${isSuper() ? "" : "disabled"}>
+          ${delegacoes.map(d => `<option ${state.filters.delegacao === d ? "selected" : ""}>${d}</option>`).join("")}
         </select>
       </div>
-    </section>
-
-    <section class="section">
-      <div class="section-head"><h2>Registo Completo</h2><span class="badge blue">${filtered.length}</span></div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Trabalhador</th><th>EPI</th><th>Data</th><th>Validade</th><th>Estado</th><th>Assinatura</th><th>Responsável</th><th>Custo (€)</th></tr></thead>
-          <tbody>
-            ${filtered.map(auditRow).join("") || `<tr><td colspan="8">Sem entregas registadas.</td></tr>`}
-          </tbody>
-        </table>
+      <div class="section-head"><h2>Trabalhadores</h2><button class="primary-btn" data-modal="worker">+ Novo</button></div>
+      <div class="worker-list">
+        ${workers.map(workerCard).join("") || `<div class="empty">Sem trabalhadores no filtro atual.</div>`}
       </div>
     </section>
   `;
 }
 
+function workerCard(worker) {
+  const s = workerStats(worker.id);
+  const cls = s.expired ? "expired" : s.warning ? "warning" : "";
+  return `
+    <button class="worker-card ${cls}" data-worker="${worker.id}">
+      <span class="avatar" style="background:#0f86b7">${initials(worker.nome)}</span>
+      <span class="worker-main">
+        <strong>${html(worker.nome)}</strong>
+        <span class="meta">${html(worker.funcao)} · ${html(worker.delegacao)}</span>
+        <span class="badges">
+          <span class="badge ok">${s.active} ativo(s)</span>
+          ${s.expired ? `<span class="badge danger">${s.expired} expirado(s)</span>` : ""}
+          ${s.warning ? `<span class="badge warn">${s.warning} a expirar</span>` : ""}
+        </span>
+      </span>
+    </button>
+  `;
+}
+
+function renderWorkerDetail() {
+  const worker = state.data.trabalhadores.find(w => w.id === state.selectedWorkerId);
+  if (!worker) { state.selectedWorkerId = null; return render(); }
+  const events = state.data.eventos.filter(e => e.idTrab === worker.id).slice().reverse();
+  const latestEntregaId = events.find(e => e.tipo === "ENTREGA")?.id;
+  appEl.innerHTML = `
+    <main>
+      <button class="ghost-btn" data-action="backPeople">← Voltar</button>
+      <section class="detail-header">
+        <span class="avatar" style="background:#0f86b7">${initials(worker.nome)}</span>
+        <div>
+          <h1>${html(worker.nome)}</h1>
+          <p class="meta">${html(worker.funcao)} · ${html(worker.delegacao)}</p>
+        </div>
+      </section>
+      <div class="action-row">
+        <button class="primary-btn" data-modal="delivery">+ Registar Entrega</button>
+        <button class="ghost-btn" data-modal="audit">Inspeção Anual</button>
+        <button class="ghost-btn" data-action="word">↓ Word Oficial</button>
+        <button class="ghost-btn" data-action="printOfficial">Imprimir/PDF</button>
+        ${isSuper() ? `<button class="danger-btn" data-action="deleteWorker">🗑 Apagar</button>` : ""}
+      </div>
+      <section class="section">
+        <div class="section-head"><h2>Linha de Tempo de Eventos</h2></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Data</th><th>Tipo</th><th>EPI/Âmbito</th><th>Qtd</th><th>Estado/Validade</th><th>Rubrica</th></tr></thead>
+            <tbody>
+              ${events.map(e => eventRow(e, worker, e.id === latestEntregaId)).join("") || `<tr><td colspan="6">Sem eventos registados.</td></tr>`}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+    ${bottomNav()}
+  `;
+}
+
+function eventRow(e, worker, isLatestEntrega) {
+  const signatures = worker ? cachedWorkerSignature(worker.id) : {};
+  const hasSig = isLatestEntrega && e.tipo === "ENTREGA" && (signatures.trabalhador || signatures.entregador) && !signatures.semAssinatura;
+  const sig = hasSig
+    ? `<img class="signature-thumb" src="${signatures.trabalhador || signatures.entregador}" alt="Assinatura">`
+    : html(e.responsavel || "Sem assinatura");
+  return `
+    <tr class="${e.tipo === "AUDITORIA_GLOBAL" ? "audit" : ""}">
+      <td>${html(e.data)}</td>
+      <td>${e.tipo === "AUDITORIA_GLOBAL" ? "Auditoria" : "Entrega"}</td>
+      <td>${html(epiLabel(e))}</td>
+      <td class="mono">${e.qtd || "—"}</td>
+      <td>${html(e.estado)}<br><span class="meta">${fmtDate(e.validade)}</span></td>
+      <td>${sig}</td>
+    </tr>
+  `;
+}
+
+function renderStock() {
+  const warehouse = isSuper() ? state.filters.stockWarehouse : state.user.armazem;
+  return `
+    <section class="section">
+      <div class="field-row">
+        <select class="select" data-filter="stockWarehouse" ${isSuper() ? "" : "disabled"}>
+          ${WAREHOUSES.map(w => `<option ${warehouse === w ? "selected" : ""}>${w}</option>`).join("")}
+        </select>
+      </div>
+      <div class="section-head">
+        <h2>Inventário · ${html(warehouse)}</h2>
+        ${isSuper() ? `<button class="primary-btn" data-modal="article">+ Artigo</button>` : ""}
+      </div>
+      <div class="stock-list">
+        ${state.data.matriz.map(epi => stockCard(epi, warehouse)).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function stockCard(epi, warehouse) {
+  const qty = stockTotal(warehouse, epi.nome);
+  const record = stockRecord(warehouse, epi.nome);
+  const sizes = stockSizeEntries(warehouse, epi.nome);
+  const tone = qty > 15 ? "ok" : qty > 5 ? "warn" : "danger";
+  return `
+    <div class="stock-card">
+      <div>
+        <strong>${html(epi.nome)}</strong>
+        <div class="risks">Riscos: ${html(epi.riscos)} · ${epi.meses} meses</div>
+        <div class="size-list">
+          ${record.loose ? `<span>Sem tamanho: ${record.loose}</span>` : ""}
+          ${sizes.map(([size, amount]) => `<span>${html(size)}: ${amount}</span>`).join("") || (!record.loose ? `<span>Sem stock por tamanho</span>` : "")}
+        </div>
+      </div>
+      <div class="stock-actions">
+        <span class="badge ${tone}">Total ${qty}</span>
+        ${isSuper() ? `<button class="ghost-btn" data-entry="${html(epi.nome)}">+ Entrada</button>` : ""}
+      </div>
+    </div>
+  `;
+}
+
+function renderAlerts() {
+  const items = alerts();
+  const expired = items.filter(a => a.alert === "expired");
+  const warning = items.filter(a => a.alert === "warning");
+  return `
+    <section class="section">
+      <div class="section-head"><h2>Expirados</h2><span class="badge danger">${expired.length}</span></div>
+      <div class="alert-list">${expired.map(alertCard).join("") || `<div class="empty">Sem EPIs expirados.</div>`}</div>
+    </section>
+    <section class="section">
+      <div class="section-head"><h2>A Expirar</h2><span class="badge warn">${warning.length}</span></div>
+      <div class="alert-list">${warning.map(alertCard).join("") || `<div class="empty">Tudo em ordem.</div>`}</div>
+    </section>
+  `;
+}
+
+function alertCard(a) {
+  return `
+    <div class="alert-card">
+      <div>
+        <strong>${html(a.epi)}</strong>
+        <span class="meta">${html(a.worker.nome)} · ${html(a.armazem)} · validade ${fmtDate(a.validade)}</span>
+      </div>
+      <button class="ghost-btn" data-renew-alert="${html(a.id)}">Trocar EPI</button>
+    </div>
+  `;
+}
+
+// ─── Auditoria ────────────────────────────────────────────────────────────────
 function auditRows() {
   const workers = scopedWorkers();
   const workerIds = new Set(workers.map(w => w.id));
@@ -846,13 +822,55 @@ function auditSummary(rows) {
   return { ativos, semAssinatura, desconhecida, expirados, aExpirar, validos, semNenhumaEntrega, workers };
 }
 
+function renderAudit() {
+  const rows = auditRows();
+  const s = auditSummary(rows);
+  const conformidade = s.ativos.length ? Math.round((s.validos.length / s.ativos.length) * 100) : 100;
+  return `
+    <section class="section">
+      <div class="section-head"><h2>Estado de Conformidade</h2></div>
+      <div class="kpi-grid">
+        <div class="kpi"><span>Entregas ativas</span><strong>${s.ativos.length}</strong></div>
+        <div class="kpi"><span>Válidas</span><strong>${s.validos.length}</strong></div>
+        <div class="kpi"><span>A expirar (≤90 dias)</span><strong>${s.aExpirar.length}</strong></div>
+        <div class="kpi"><span>Expiradas</span><strong>${s.expirados.length}</strong></div>
+        <div class="kpi"><span>Sem assinatura</span><strong>${s.semAssinatura.length}</strong></div>
+        <div class="kpi"><span>Trabalhadores sem entregas</span><strong>${s.semNenhumaEntrega.length}</strong></div>
+      </div>
+      <p class="meta">Taxa de conformidade (entregas ativas dentro da validade): <strong>${conformidade}%</strong>.
+        As assinaturas e o registo completo de cada entrega ficam gravados de forma imutável na coleção
+        <span class="mono">deliveries</span> do Firestore — a app nunca edita nem apaga esses documentos, só acrescenta.</p>
+      <button class="primary-btn" data-action="exportAuditCsv">↓ Exportar Auditoria (CSV)</button>
+    </section>
+
+    ${s.semNenhumaEntrega.length ? `
+    <section class="section">
+      <div class="section-head"><h2>Trabalhadores sem qualquer entrega</h2><span class="badge danger">${s.semNenhumaEntrega.length}</span></div>
+      <div class="alert-list">${s.semNenhumaEntrega.map(w => `
+        <div class="alert-card"><div><strong>${html(w.nome)}</strong><span class="meta">${html(w.funcao)} · ${html(w.delegacao)}</span></div></div>
+      `).join("")}</div>
+    </section>` : ""}
+
+    <section class="section">
+      <div class="section-head"><h2>Registo Completo</h2><span class="badge blue">${rows.length}</span></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Trabalhador</th><th>EPI</th><th>Data</th><th>Validade</th><th>Estado</th><th>Assinatura</th><th>Responsável</th></tr></thead>
+          <tbody>
+            ${rows.map(auditRow).join("") || `<tr><td colspan="7">Sem entregas registadas.</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  `;
+}
+
 function auditRow(r) {
   const isActive = r.statusAlerta === "ATIVO";
   const statusLabel = isActive ? ({ expired: "Expirado", warning: "A expirar", normal: "Válido" }[r.status] || r.estado) : "Substituída (baixa)";
   const statusBadge = isActive ? ({ expired: "danger", warning: "warn", normal: "ok" }[r.status] || "blue") : "blue";
   const sigLabel = r.assinado === true ? "Sim" : r.assinado === false ? "Não" : "N/D (anterior)";
   const sigBadge = r.assinado === true ? "ok" : r.assinado === false ? "danger" : "blue";
-  const custo = (Number(r.qtd || 0) * Number(r.preco_unitario || 0));
   return `
     <tr>
       <td>${html(r.worker?.nome || "—")}</td>
@@ -862,27 +880,20 @@ function auditRow(r) {
       <td><span class="badge ${statusBadge}">${html(statusLabel)}</span></td>
       <td><span class="badge ${sigBadge}">${sigLabel}</span></td>
       <td>${html(r.responsavel)}</td>
-      <td class="mono">${custo ? money(custo) : "—"}</td>
     </tr>
   `;
 }
 
-function epiLabel(event) {
-  return `${event.epi}${event.tamanho ? ` · Tam. ${event.tamanho}` : ""}`;
-}
-
 function exportAuditCsv() {
   const rows = auditRows();
-  const header = ["Trabalhador", "Função", "Delegação", "EPI", "Tamanho", "Data Entrega", "Validade", "Estado", "Assinatura", "Responsável", "Custo (€)"];
+  const header = ["Trabalhador", "Função", "Delegação", "EPI", "Tamanho", "Data Entrega", "Validade", "Estado", "Assinatura", "Responsável"];
   const csvLines = [header.join(";")];
   rows.forEach(r => {
     const sig = r.assinado === true ? "Sim" : r.assinado === false ? "Não" : "N/D (anterior)";
     const statusLabel = r.statusAlerta === "ATIVO" ? ({ expired: "Expirado", warning: "A expirar", normal: "Válido" }[r.status] || r.estado) : "Substituída (baixa)";
-    const custo = (Number(r.qtd || 0) * Number(r.preco_unitario || 0));
     csvLines.push([
       r.worker?.nome || "", r.worker?.funcao || "", r.worker?.delegacao || "",
-      r.epi, r.tamanho || "", r.data, fmtDate(r.validade), statusLabel, sig, r.responsavel,
-      custo ? custo.toFixed(2) : ""
+      r.epi, r.tamanho || "", r.data, fmtDate(r.validade), statusLabel, sig, r.responsavel
     ].map(v => `"${String(v ?? "").replace(/"/g, '""')}"`).join(";"));
   });
   downloadTextFile("\uFEFF" + csvLines.join("\r\n"), `auditoria-epi-${todayISO()}.csv`, "text/csv;charset=utf-8");
@@ -1008,7 +1019,28 @@ function operadoresModal() {
 }
 
 function budgetModal() {
-  openModal("Editar Orçamento", `<p>Use o separador "Orçamento".</p>`);
+  const budget = state.data.budget || { limit: 0, items: {} };
+  openModal("Editar Orçamento", `
+    <form data-form="budget">
+      <div class="field-row">
+        <input class="input" name="limit" type="number" min="0" step="1" value="${Number(budget.limit || 0)}" placeholder="Limite geral disponível">
+      </div>
+      <div class="budget-editor">
+        <div class="budget-editor-head"><span>EPI</span><span>Posso gastar</span><span>Gasto</span></div>
+        ${state.data.matriz.map((epi, i) => {
+          const item = budget.items?.[epi.nome] || {};
+          return `
+            <div class="budget-editor-row">
+              <span>${html(epi.nome)}</span>
+              <input class="input" name="planned_${i}" type="number" min="0" step="1" value="${Number(item.planned || 0)}">
+              <input class="input" name="spent_${i}" type="number" min="0" step="1" value="${Number(item.spent || 0)}">
+            </div>
+          `;
+        }).join("")}
+      </div>
+      <button class="primary-btn" type="submit">Guardar Orçamento</button>
+    </form>
+  `);
 }
 
 function entryModal(epiName) {
@@ -1176,7 +1208,7 @@ function handleConfirmKioskPhase() {
     }
     state.kioskPhase = 'deliverer';
     renderKiosk();
-  } else {
+  } else { // deliverer
     state.pendingDelivererSig = isEmpty ? null : pad.toData();
     state.pendingNoSignDeliverer = false;
     if (isEmpty) {
@@ -1247,8 +1279,7 @@ async function confirmDeliveryWithStoredSignatures() {
   });
   const assinado = withSignature && !semAssinatura;
   payload.items.forEach(item => {
-    const preco = state.data.precos[item.epi.nome] || 0;
-    const event = makeEventRaw(worker, item.epi, item.qtd, item.validade, 'ATIVO', responsavel, item.tamanho, preco);
+    const event = makeEventRaw(worker, item.epi, item.qtd, item.validade, 'ATIVO', responsavel, item.tamanho);
     event.assinado = assinado;
     state.data.eventos.push(event);
     removeStock(worker.delegacao, item.epi.nome, item.qtd, item.tamanho);
@@ -1271,65 +1302,36 @@ async function confirmDeliveryWithStoredSignatures() {
 
 // ─── Event listeners ──────────────────────────────────────────────────────────
 document.addEventListener("click", ev => {
-  // Login: selecionar utilizador
-  const loginPin = ev.target.closest("[data-login-user]")?.dataset.loginUser;
-  if (loginPin) {
-    state.loginUser = USERS.find(u => u.pin === loginPin);
-    state.pin = ""; // limpa o PIN ao mudar de utilizador
-    renderLogin();
-    return;
-  }
+  const operador = ev.target.closest("[data-operador]")?.dataset.operador;
+  if (operador) { state.operadorAtual = operador; render(); return; }
 
-  // Teclas do PIN
+  const loginPin = ev.target.closest("[data-login-user]")?.dataset.loginUser;
+  if (loginPin) { state.loginUser = USERS.find(u => u.pin === loginPin); state.pin = ""; renderLogin(); return; }
+
   const key = ev.target.closest("[data-key]")?.dataset.key;
   if (key) {
-    if (key === "⌫") {
-      state.pin = state.pin.slice(0, -1);
-    } else if (key === "OK") {
-      tryLogin();
-    } else {
-      if (state.pin.length < 4) {
-        state.pin += key;
-      }
-    }
-    // Se o PIN atingiu 4 dígitos, tenta login automaticamente
-    if (state.pin.length === 4 && key !== "OK") {
-      tryLogin();
-    } else {
-      renderLogin();
-    }
+    state.pin = state.pin || "";
+    if (key === "⌫") state.pin = state.pin.slice(0, -1);
+    else if (key === "OK") tryLogin();
+    else if (state.pin.length < 4) state.pin += key;
+    if (state.pin.length === 4) tryLogin();
+    else renderLogin();
     return;
   }
 
-  // Navegação
   const page = ev.target.closest("[data-page]")?.dataset.page;
   if (page) { state.page = page; state.selectedWorkerId = null; render(); return; }
 
-  // Ações
   const actionTarget = ev.target.closest("[data-action]");
   const action = actionTarget?.dataset.action;
   if (action) { handleAction(action, actionTarget); return; }
 
-  // Workers
   const workerId = ev.target.closest("[data-worker]")?.dataset.worker;
   if (workerId) { state.selectedWorkerId = Number(workerId); render(); return; }
 
-  // Modais
   const modal = ev.target.closest("[data-modal]")?.dataset.modal;
-  if (modal) {
-    const modalMap = {
-      worker: workerModal,
-      delivery: deliveryModal,
-      audit: auditModal,
-      article: articleModal,
-      budget: budgetModal,
-      operadores: operadoresModal
-    };
-    modalMap[modal]?.();
-    return;
-  }
+  if (modal) { ({ worker: workerModal, delivery: deliveryModal, audit: auditModal, article: articleModal, budget: budgetModal, operadores: operadoresModal })[modal]?.(); return; }
 
-  // Renovar alerta
   const renewAlertId = ev.target.closest("[data-renew-alert]")?.dataset.renewAlert;
   if (renewAlertId) {
     const alertEvent = alerts().find(a => a.id === renewAlertId);
@@ -1337,7 +1339,6 @@ document.addEventListener("click", ev => {
     return;
   }
 
-  // Apagar operador
   const delOp = ev.target.closest("[data-del-op]")?.dataset.delOp;
   if (delOp !== undefined) {
     state.data.operadores.splice(Number(delOp), 1);
@@ -1346,50 +1347,12 @@ document.addEventListener("click", ev => {
     return;
   }
 
-  // Entrada stock
   const entry = ev.target.closest("[data-entry]")?.dataset.entry;
   if (entry) entryModal(entry);
 
-  // Fechar modal
   if (ev.target.matches("[data-close-modal]")) closeModal();
-
-  // Guardar preços / limite
-  if (ev.target.id === "save-precos") savePrecos();
-  if (ev.target.id === "save-budget-limit") saveBudgetLimit();
-
-  // Operador picker
-  const operador = ev.target.closest("[data-operador]")?.dataset.operador;
-  if (operador) { state.operadorAtual = operador; render(); return; }
 });
 
-// ─── Funções para guardar orçamento ──────────────────────────────────────
-function savePrecos() {
-  const inputs = document.querySelectorAll('.preco-input');
-  inputs.forEach(inp => {
-    const epi = inp.dataset.epi;
-    const val = parseFloat(inp.value);
-    if (!isNaN(val) && val >= 0) {
-      state.data.precos[epi] = val;
-    }
-  });
-  saveAll();
-  showToast('Preços guardados com sucesso!');
-  render();
-}
-
-function saveBudgetLimit() {
-  const input = document.getElementById('budget-limit');
-  if (!input) return;
-  const val = parseFloat(input.value);
-  if (!isNaN(val) && val >= 0) {
-    state.data.budget.limit = val;
-    saveAll();
-    showToast('Limite guardado com sucesso!');
-    render();
-  }
-}
-
-// ─── Outras ações ──────────────────────────────────────────────────────────
 function tryLogin() {
   if (state.pin === state.loginUser.pin) {
     state.user = state.loginUser;
@@ -1401,7 +1364,7 @@ function tryLogin() {
     const panel = document.querySelector("#pin-panel");
     state.pin = "";
     panel?.classList.add("shake");
-    setTimeout(() => renderLogin(), 450);
+    setTimeout(renderLogin, 450);
   }
 }
 
@@ -1458,16 +1421,6 @@ function removeDeliveryItem(target) {
   if (items.length <= 1) return;
   target?.closest(".delivery-item")?.remove();
 }
-
-// ─── Filtros de auditoria (change) ──────────────────────────────────────
-document.addEventListener("change", ev => {
-  const filter = ev.target.closest("[data-audit-filter]");
-  if (filter) {
-    const key = filter.dataset.auditFilter;
-    state.auditFilters[key] = filter.value;
-    render();
-  }
-});
 
 document.addEventListener("input", ev => {
   const filter = ev.target.dataset.filter;
@@ -1533,7 +1486,6 @@ document.addEventListener("submit", async ev => {
   if (kind === "article") {
     const epi = { nome: form.nome.value.trim().toUpperCase(), riscos: form.riscos.value.trim(), meses: Number(form.meses.value) };
     state.data.matriz.push(epi);
-    state.data.precos[epi.nome] = 0;
     WAREHOUSES.forEach(w => { state.data.stocks[w][epi.nome] = { loose: 0, sizes: {} }; });
     await saveAll(); closeModal(); render();
   }
@@ -1544,11 +1496,24 @@ document.addEventListener("submit", async ev => {
     await saveAll(); closeModal(); render();
   }
   if (kind === "budget") {
-    // já não usado
+    const items = {};
+    state.data.matriz.forEach((epi, i) => {
+      const planned = Number(form[`planned_${i}`]?.value || 0);
+      const spent = Number(form[`spent_${i}`]?.value || 0);
+      if (planned || spent) items[epi.nome] = { planned, spent };
+    });
+    state.data.budget = { limit: Number(form.limit.value || 0), items };
+    await saveAll(); closeModal(); render();
   }
 });
 
 // ─── PDF / Word / Print ──────────────────────────────────────────────────────
+function workerDeliveryHistory(worker) {
+  return state.data.eventos
+    .filter(e => e.idTrab === worker.id && e.tipo === "ENTREGA" && e.statusAlerta === "ATIVO")
+    .slice().sort((a, b) => String(a.id).localeCompare(String(b.id)));
+}
+
 function workerOfficialRows(worker) {
   return state.data.eventos
     .filter(e => e.idTrab === worker.id && ((e.tipo === "ENTREGA" && e.statusAlerta === "ATIVO") || e.tipo === "AUDITORIA_GLOBAL"))
@@ -1809,18 +1774,12 @@ h3{font-size:8pt;margin:5pt 0 2pt}
   printWindow.document.close();
 }
 
-function epiRiscos(event) {
-  if (event.tipo === "AUDITORIA_GLOBAL") return "—";
-  return state.data.matriz.find(m => m.nome === event.epi)?.riscos || "";
-}
-
 // ─── Icons ────────────────────────────────────────────────────────────────────
 function iconHome() { return `<svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 10v10h14V10"/><path d="M9 20v-6h6v6"/></svg>`; }
 function iconUsers() { return `<svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>`; }
 function iconBox() { return `<svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="m21 8-9-5-9 5 9 5 9-5Z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/></svg>`; }
 function iconBell() { return `<svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>`; }
 function iconAudit() { return `<svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M9 11.5 11 13.5 15.5 9"/><path d="M12 3 4 6v6c0 5 3.5 8.5 8 9 4.5-.5 8-4 8-9V6l-8-3Z"/></svg>`; }
-function iconBudget() { return `<svg viewBox="0 0 24 24" fill="none" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M8 12h8"/><path d="M12 8v8"/></svg>`; }
 
 // ─── Arranque ─────────────────────────────────────────────────────────────────
 renderLogin();
