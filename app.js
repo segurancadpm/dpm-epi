@@ -2,11 +2,8 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
 import {
   getFirestore, doc, getDoc, setDoc, onSnapshot, collection, getDocs,
-  addDoc, query, where
+  query, where, addDoc
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
-// Nota: a captura de assinatura é feita com um mini "signature pad" próprio,
-// mais abaixo (createSignaturePad), sem dependências externas — evita qualquer
-// falha silenciosa de carregamento de biblioteca de terceiros.
 
 const firebaseConfig = {
   apiKey: "AIzaSyAqt5RDygjfeQZ3zq8dYhEGbyIjg00Bbks",
@@ -79,17 +76,19 @@ const state = {
   data: defaultData(),
   syncing: false,
   loaded: false,
-  // Cache em memória: workerId -> última assinatura (renderizada a partir dos
-  // pontos vetoriais). Evita repetir a query ao Firestore em cada render.
-  workerSignatureCache: {}
+  workerSignatureCache: {},
+  // Kiosk state
+  kioskPhase: null,          // 'worker' ou 'deliverer'
+  pendingDelivery: null,
+  pendingWorkerSig: null,
+  pendingDelivererSig: null,
+  pendingNoSignWorker: false,
+  pendingNoSignDeliverer: false,
+  currentPad: null,          // instância do signature pad ativo
 };
 
 // ─── Firestore helpers ───────────────────────────────────────────────────────
 const MAIN_DOC = "dpm_epi_data_v1";
-// Cada entrega passa a ser o SEU PRÓPRIO documento nesta coleção (nunca sobrescrito),
-// em vez de um único campo por trabalhador dentro do documento principal.
-// Isto resolve o limite de tamanho de documento do Firestore (1 MiB) e mantém
-// o histórico completo de assinaturas de todas as entregas, sem perdas.
 const DELIVERIES_COLLECTION = "deliveries";
 
 function defaultData() {
@@ -118,7 +117,6 @@ async function loadFromFirestore() {
       state.data = snap.data();
       ensureDataShape();
     } else {
-      // primeira vez: gravar dados iniciais
       await saveAll();
     }
   } catch (e) {
@@ -143,12 +141,10 @@ async function saveAll() {
   }
 }
 
-// Escuta mudanças em tempo real (outros utilizadores)
 function subscribeRealtime() {
   onSnapshot(doc(db, "appdata", MAIN_DOC), (snap) => {
     if (!snap.exists()) return;
     const newData = snap.data();
-    // só atualiza se não estamos a gravar nós próprios
     if (!state.syncing) {
       state.data = newData;
       ensureDataShape();
@@ -207,13 +203,6 @@ function ensureDataShape() {
   });
 }
 
-// Migração única: as assinaturas antigas (imagem base64, uma por trabalhador,
-// guardadas em state.data.latestSignatures dentro do documento principal) passam
-// a viver como um documento normal na coleção "deliveries" (campo legacy_image,
-// já que não há pontos vetoriais para uma assinatura antiga em imagem).
-// Só se remove uma entrada de latestSignatures DEPOIS de confirmar que a
-// migração desse trabalhador foi gravada com sucesso no Firestore — nada é
-// apagado "às cegas".
 async function migrateLegacySignatures() {
   const legacy = state.data.latestSignatures || {};
   const workerIds = Object.keys(legacy);
@@ -237,7 +226,6 @@ async function migrateLegacySignatures() {
         sem_assinatura: !!record.semAssinatura,
         signature_points_trabalhador: null,
         signature_points_entregador: null,
-        // Assinatura antiga só existia como imagem — preserva-se tal-qual, marcada como legada.
         legacy_image_trabalhador: record.trabalhador || null,
         legacy_image_entregador: record.entregador || null,
         legacy: true,
@@ -256,12 +244,6 @@ async function migrateLegacySignatures() {
   render();
 }
 
-// O documento principal (appdata) não deve crescer para sempre — mesmo sem as
-// assinaturas (já fora, na coleção "deliveries"), o array "eventos" acumula-se
-// ano após ano. Isto arquiva, de forma manual e reversível, os eventos com mais
-// de 24 meses que já não têm um alerta ativo (ou seja, já foram substituídos por
-// uma entrega mais recente) — mantém o documento principal pequeno e rápido.
-// Nada é apagado sem primeiro confirmar que foi gravado com sucesso no Firestore.
 function parsePtDate(str) {
   const [d, m, y] = String(str || "").split("/").map(Number);
   if (!d || !m || !y) return null;
@@ -623,8 +605,6 @@ function epiLabel(event) {
   return `${event.epi}${event.tamanho ? ` · Tam. ${event.tamanho}` : ""}`;
 }
 
-// Os riscos já não se guardam por evento (eram redundantes com o matriz e
-// ficavam desatualizados se o matriz fosse editado depois). Consulta-se aqui.
 function epiRiscos(event) {
   if (event.tipo === "AUDITORIA_GLOBAL") return "—";
   return state.data.matriz.find(m => m.nome === event.epi)?.riscos || "";
@@ -730,9 +710,6 @@ function renderWorkerDetail() {
 }
 
 function eventRow(e, worker, isLatestEntrega) {
-  // As assinaturas já não se guardam por evento, vivem na coleção "deliveries"
-  // do Firestore (uma por entrega). Aqui usa-se a cache local (populada de forma
-  // assíncrona) para mostrar a assinatura real na entrega mais recente.
   const signatures = worker ? cachedWorkerSignature(worker.id) : {};
   const hasSig = isLatestEntrega && e.tipo === "ENTREGA" && (signatures.trabalhador || signatures.entregador) && !signatures.semAssinatura;
   const sig = hasSig
@@ -822,10 +799,6 @@ function alertCard(a) {
 }
 
 // ─── Auditoria ────────────────────────────────────────────────────────────────
-// Base o painel inteiro em state.data.eventos (local, em tempo real, sem custo
-// de leituras ao Firestore): cada entrega já tem data, validade e o marcador
-// "assinado". A assinatura em si (e a prova legal completa) fica sempre em
-// "deliveries/", nunca é editada nem apagada pela app — só se acrescenta.
 function auditRows() {
   const workers = scopedWorkers();
   const workerIds = new Set(workers.map(w => w.id));
@@ -923,7 +896,6 @@ function exportAuditCsv() {
       r.epi, r.tamanho || "", r.data, fmtDate(r.validade), statusLabel, sig, r.responsavel
     ].map(v => `"${String(v ?? "").replace(/"/g, '""')}"`).join(";"));
   });
-  // BOM para o Excel abrir os acentos corretamente
   downloadTextFile("\uFEFF" + csvLines.join("\r\n"), `auditoria-epi-${todayISO()}.csv`, "text/csv;charset=utf-8");
 }
 
@@ -1088,36 +1060,83 @@ function entryModal(epiName) {
 // ─── Kiosk / assinatura ───────────────────────────────────────────────────────
 function startKiosk(payload) {
   closeModal();
-  const itemSummary = payload.items.map(item => `${html(item.epi.nome)}${item.tamanho ? ` · Tam. ${html(item.tamanho)}` : ""} · Qtd ${item.qtd}`).join("<br>");
-  appEl.insertAdjacentHTML("beforeend", `
-    <section class="kiosk" id="kiosk">
-      <header>
-        <div><h1>Assinaturas</h1><p class="meta">${html(payload.worker.nome)}<br>${itemSummary}</p></div>
-        <button class="ghost-btn" data-action="cancelKiosk">Cancelar</button>
-      </header>
-      <div>
-        <p class="legal">Declaro ter recebido os equipamentos de proteção individual indicados, em bom estado, comprometendo-me a utilizá-los corretamente, conforme informação e formação recebida nos termos do Decreto-Lei 102/2009.</p>
-        <label class="signature-label">Assinatura do trabalhador</label>
-        <canvas class="signature-pad compact" id="worker-signature-pad"></canvas>
-        <label class="signature-label">Rubrica de quem entrega</label>
-        <canvas class="signature-pad compact" id="deliverer-signature-pad"></canvas>
-      </div>
-      <div class="kiosk-actions">
-        <button class="ghost-btn" data-action="clearSign">Limpar</button>
-        <button class="ghost-btn" data-action="noSign">Sem assinatura</button>
-        <button class="primary-btn" data-action="confirmDelivery">Confirmar e Guardar</button>
-      </div>
-    </section>
-  `);
   state.pendingDelivery = payload;
-  setupSignatureCanvases();
-  document.querySelector("#kiosk")?.requestFullscreen?.().catch(() => {});
+  state.kioskPhase = 'worker';
+  state.pendingWorkerSig = null;
+  state.pendingDelivererSig = null;
+  state.pendingNoSignWorker = false;
+  state.pendingNoSignDeliverer = false;
+  renderKiosk();
 }
 
-// Mini "signature pad" próprio — grava os pontos de cada traço (formato
-// vetorial: array de traços, cada traço é um array de {x,y}) em vez de pixels.
-// Sem dependências externas: o mesmo mecanismo de captura por ponteiro que a
-// app já usava, só que agora guarda os pontos em vez de só desenhar.
+function renderKiosk() {
+  const phase = state.kioskPhase;
+  const payload = state.pendingDelivery;
+  if (!payload) return;
+
+  const workerName = payload.worker.nome;
+  const itemSummary = payload.items.map(item =>
+    `${item.epi.nome}${item.tamanho ? ` · Tam. ${item.tamanho}` : ''} · Qtd ${item.qtd}`
+  ).join('<br>');
+
+  const isWorker = phase === 'worker';
+  const title = isWorker ? 'Assinatura do Trabalhador' : 'Rubrica de Quem Entrega';
+  const instruction = isWorker
+    ? 'Declaro ter recebido os EPIs indicados, em bom estado, comprometendo-me a utilizá-los corretamente.'
+    : 'Confirmo a entrega dos EPIs ao trabalhador, nos termos da formação e informação prestada.';
+
+  let kioskEl = document.querySelector('#kiosk');
+  if (!kioskEl) {
+    kioskEl = document.createElement('section');
+    kioskEl.id = 'kiosk';
+    kioskEl.className = 'kiosk';
+    document.body.appendChild(kioskEl);
+  }
+
+  kioskEl.innerHTML = `
+    <header>
+      <div>
+        <h1>${title}</h1>
+        <p class="meta">${workerName}<br>${itemSummary}</p>
+      </div>
+      <button class="ghost-btn" data-action="cancelKiosk">Cancelar</button>
+    </header>
+    <div>
+      <p class="legal">${instruction}</p>
+      <label class="signature-label">Assine abaixo</label>
+      <canvas class="signature-pad" id="kiosk-signature-pad"></canvas>
+    </div>
+    <div class="kiosk-actions">
+      <button class="ghost-btn" data-action="clearSign">Limpar</button>
+      <button class="ghost-btn" data-action="noSign">Sem assinatura</button>
+      <button class="primary-btn" data-action="confirmKioskPhase">
+        ${isWorker ? 'Confirmar assinatura →' : 'Confirmar e Guardar'}
+      </button>
+    </div>
+  `;
+
+  const canvas = document.querySelector('#kiosk-signature-pad');
+  if (canvas) {
+    state.currentPad = createSignaturePad(canvas);
+  }
+
+  requestAnimationFrame(() => {
+    const canvasEl = document.querySelector('#kiosk-signature-pad');
+    if (canvasEl) {
+      const rect = canvasEl.getBoundingClientRect();
+      const ratio = Math.max(window.devicePixelRatio || 1, 1);
+      canvasEl.width = Math.max(1, Math.floor(rect.width * ratio));
+      canvasEl.height = Math.max(1, Math.floor(rect.height * ratio));
+      const ctx = canvasEl.getContext('2d');
+      ctx.scale(ratio, ratio);
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.strokeStyle = '#ffc35a';
+      ctx.lineWidth = 3;
+    }
+  });
+}
+
 function createSignaturePad(canvas) {
   if (!canvas) return null;
   const ratio = Math.max(window.devicePixelRatio || 1, 1);
@@ -1131,9 +1150,6 @@ function createSignaturePad(canvas) {
   ctx.strokeStyle = "#ffc35a";
   ctx.lineWidth = 3;
 
-  // Firestore não aceita "arrays dentro de arrays" (array cujo elemento é
-  // diretamente outro array). Por isso cada traço é um objeto {points:[...]},
-  // não um array direto — um array de objetos-com-array-lá-dentro é permitido.
   const strokes = [];
   let currentStroke = null;
   let drawing = false;
@@ -1177,73 +1193,110 @@ function createSignaturePad(canvas) {
   };
 }
 
-function setupSignatureCanvases() {
-  state.workerPad = createSignaturePad(document.querySelector("#worker-signature-pad"));
-  state.delivererPad = createSignaturePad(document.querySelector("#deliverer-signature-pad"));
+function handleConfirmKioskPhase() {
+  const phase = state.kioskPhase;
+  const pad = state.currentPad;
+  const isEmpty = !pad || pad.isEmpty();
+
+  if (phase === 'worker') {
+    state.pendingWorkerSig = isEmpty ? null : pad.toData();
+    state.pendingNoSignWorker = false;
+    if (isEmpty) {
+      if (!confirm('A assinatura do trabalhador está vazia. Pretende avançar mesmo assim?')) {
+        return;
+      }
+    }
+    state.kioskPhase = 'deliverer';
+    renderKiosk();
+  } else { // deliverer
+    state.pendingDelivererSig = isEmpty ? null : pad.toData();
+    state.pendingNoSignDeliverer = false;
+    if (isEmpty) {
+      if (!confirm('A rubrica de quem entrega está vazia. Pretende guardar mesmo assim?')) {
+        return;
+      }
+    }
+    confirmDeliveryWithStoredSignatures();
+  }
 }
 
-async function confirmDelivery(withSignature = true) {
+function handleNoSign() {
+  const phase = state.kioskPhase;
+  if (phase === 'worker') {
+    state.pendingWorkerSig = null;
+    state.pendingNoSignWorker = true;
+    if (state.currentPad) state.currentPad.clear();
+    state.kioskPhase = 'deliverer';
+    renderKiosk();
+  } else {
+    state.pendingDelivererSig = null;
+    state.pendingNoSignDeliverer = true;
+    if (state.currentPad) state.currentPad.clear();
+    confirmDeliveryWithStoredSignatures();
+  }
+}
+
+async function confirmDeliveryWithStoredSignatures() {
   const payload = state.pendingDelivery;
   if (!payload) return;
+
   const worker = payload.worker;
   const responsavel = payload.responsavel || state.user.nome;
   const deliveryDate = todayISO();
 
-  // Pontos vetoriais do traço (formato toData() do signature_pad), não imagem.
-  // Ficam null se não houver traço desenhado ou se "Sem assinatura" foi escolhido.
-  const workerPoints = withSignature && state.workerPad && !state.workerPad.isEmpty() ? state.workerPad.toData() : null;
-  const delivererPoints = withSignature && state.delivererPad && !state.delivererPad.isEmpty() ? state.delivererPad.toData() : null;
+  const hasWorkerSig = state.pendingWorkerSig !== null && state.pendingWorkerSig.length > 0;
+  const hasDelivererSig = state.pendingDelivererSig !== null && state.pendingDelivererSig.length > 0;
+  const withSignature = hasWorkerSig || hasDelivererSig;
+  const semAssinatura = !withSignature || state.pendingNoSignWorker || state.pendingNoSignDeliverer;
 
   try {
-    // Cada EPI entregue gera o SEU PRÓPRIO documento em "deliveries" — nunca
-    // atualiza nem apaga documentos de entregas anteriores desse trabalhador.
     await Promise.all(payload.items.map(item => addDoc(collection(db, DELIVERIES_COLLECTION), {
       worker_id: worker.id,
       worker_nome: worker.nome,
       epi_type: item.epi.nome,
       qtd: item.qtd,
-      tamanho: String(item.tamanho || "").trim().toUpperCase(),
+      tamanho: String(item.tamanho || '').trim().toUpperCase(),
       delivery_date: deliveryDate,
       validity_date: item.validade,
       riscos: item.epi.riscos,
       responsavel,
-      sem_assinatura: !withSignature,
-      signature_points_trabalhador: workerPoints,
-      signature_points_entregador: delivererPoints,
+      sem_assinatura: semAssinatura,
+      signature_points_trabalhador: state.pendingWorkerSig,
+      signature_points_entregador: state.pendingDelivererSig,
       created_at: Date.now()
     })));
   } catch (e) {
-    console.error("Erro a gravar assinatura da entrega:", e);
-    // alert() em vez de só um toast: isto NÃO PODE passar despercebido —
-    // se falhar, a entrega não fica registada e é preciso perceber porquê.
-    alert(`Não foi possível guardar a entrega/assinatura.\n\nErro: ${e.code || ""} ${e.message || e}\n\nA entrega NÃO foi registada. Tira uma foto a este ecrã e mostra ao responsável técnico.`);
+    console.error('Erro a gravar assinatura da entrega:', e);
+    alert(`Não foi possível guardar a entrega/assinatura.\n\nErro: ${e.code || ''} ${e.message || e}\n\nA entrega NÃO foi registada. Tira uma foto a este ecrã e mostra ao responsável técnico.`);
     return;
   }
 
-  // state.data.eventos mantém-se leve (sem dados de assinatura) — serve só
-  // para a linha do tempo, alertas de validade e baixa de stock local.
   state.data.eventos.forEach(e => {
-    if (e.idTrab === worker.id && e.tipo === "ENTREGA" && payload.items.some(item => item.epi.nome === e.epi) && e.statusAlerta === "ATIVO") {
-      e.statusAlerta = "BAIXA";
-      e.estado = "Baixa por nova entrega";
+    if (e.idTrab === worker.id && e.tipo === 'ENTREGA' && payload.items.some(item => item.epi.nome === e.epi) && e.statusAlerta === 'ATIVO') {
+      e.statusAlerta = 'BAIXA';
+      e.estado = 'Baixa por nova entrega';
     }
   });
-  const assinado = withSignature && !!(workerPoints || delivererPoints);
+  const assinado = withSignature && !semAssinatura;
   payload.items.forEach(item => {
-    const event = makeEventRaw(worker, item.epi, item.qtd, item.validade, "ATIVO", responsavel, item.tamanho);
-    // Marcador leve (booleano) de que esta entrega tem assinatura vetorial
-    // gravada em "deliveries/" — usado só para a auditoria; a assinatura em
-    // si nunca fica aqui, só o "sim/não" de que existe.
+    const event = makeEventRaw(worker, item.epi, item.qtd, item.validade, 'ATIVO', responsavel, item.tamanho);
     event.assinado = assinado;
     state.data.eventos.push(event);
     removeStock(worker.delegacao, item.epi.nome, item.qtd, item.tamanho);
   });
   invalidateSignatureCache(worker.id);
   await saveAll();
-  document.exitFullscreen?.().catch(() => {});
-  document.querySelector("#kiosk")?.remove();
+
+  document.querySelector('#kiosk')?.remove();
   state.pendingDelivery = null;
-  appEl.insertAdjacentHTML("beforeend", `<div class="success-pop">Entrega guardada</div>`);
+  state.kioskPhase = null;
+  state.currentPad = null;
+  state.pendingWorkerSig = null;
+  state.pendingDelivererSig = null;
+  state.pendingNoSignWorker = false;
+  state.pendingNoSignDeliverer = false;
+
+  appEl.insertAdjacentHTML('beforeend', `<div class="success-pop">Entrega guardada</div>`);
   setTimeout(() => render(), 900);
 }
 
@@ -1335,10 +1388,22 @@ function handleAction(action, target = null) {
   if (action === "word") exportWordOfficial();
   if (action === "printOfficial") openPrintOfficial();
   if (action === "deleteWorker") deleteWorker();
-  if (action === "cancelKiosk") { document.exitFullscreen?.().catch(() => {}); document.querySelector("#kiosk")?.remove(); state.pendingDelivery = null; }
-  if (action === "clearSign") { state.workerPad?.clear(); state.delivererPad?.clear(); }
-  if (action === "noSign") confirmDelivery(false);
-  if (action === "confirmDelivery") confirmDelivery(true);
+  if (action === "cancelKiosk") {
+    document.querySelector('#kiosk')?.remove();
+    state.pendingDelivery = null;
+    state.kioskPhase = null;
+    state.currentPad = null;
+    state.pendingWorkerSig = null;
+    state.pendingDelivererSig = null;
+    state.pendingNoSignWorker = false;
+    state.pendingNoSignDeliverer = false;
+    render();
+  }
+  if (action === "clearSign") {
+    if (state.currentPad) state.currentPad.clear();
+  }
+  if (action === "noSign") handleNoSign();
+  if (action === "confirmKioskPhase") handleConfirmKioskPhase();
   if (action === "addDeliveryItem") addDeliveryItem();
   if (action === "removeDeliveryItem") removeDeliveryItem(target);
   if (action === "migrateSignatures") migrateLegacySignatures();
@@ -1456,13 +1521,6 @@ function workerOfficialRows(worker) {
     .sort((a, b) => String(a.id).localeCompare(String(b.id)));
 }
 
-// Desenha um conjunto de pontos vetoriais (formato signature_pad toData()) num
-// canvas invisível só para gerar a miniatura/imagem usada no Word e na impressão
-// oficial. Os pontos em si são o que fica gravado no Firestore, não a imagem.
-// Desenha os traços gravados (array de traços; cada traço é uma lista de
-// pontos {x,y}) num canvas só para gerar a imagem usada no Word/impressão.
-// Os pontos em si são o que fica gravado no Firestore, não esta imagem —
-// esta é sempre reconstruída na hora, a partir dos pontos.
 function renderSignaturePoints(strokes) {
   if (!strokes || !strokes.length) return null;
   const width = 260, height = 100, pad = 10;
@@ -1512,14 +1570,8 @@ function renderSignaturePoints(strokes) {
   return canvas.toDataURL("image/jpeg", 0.7);
 }
 
-// Vai ao Firestore buscar a entrega mais recente desse trabalhador que tenha
-// assinatura, e converte os pontos vetoriais numa imagem só para mostrar/imprimir.
-// Nunca sobrescreve nada: lê sempre o documento mais recente da coleção "deliveries".
 async function fetchLatestSignature(workerId) {
   try {
-    // Só filtra por worker_id (índice automático de campo único). Ordenar por
-    // created_at exigiria um índice composto a criar manualmente na consola do
-    // Firebase — em vez disso, ordena-se aqui no browser, sem dependências externas.
     const q = query(collection(db, DELIVERIES_COLLECTION), where("worker_id", "==", workerId));
     const snap = await getDocs(q);
     if (!snap.empty) {
@@ -1532,8 +1584,6 @@ async function fetchLatestSignature(workerId) {
         semAssinatura: !!latest.sem_assinatura
       };
     }
-    // Sem documentos na nova coleção: procura um registo antigo (pré-migração),
-    // guardado como imagem base64 no documento principal, para não perder o histórico.
     const legacy = state.data.latestSignatures?.[workerId];
     if (legacy) {
       return { trabalhador: legacy.trabalhador || null, entregador: legacy.entregador || null, responsavel: legacy.responsavel || "", semAssinatura: !!legacy.semAssinatura, legacyImage: true };
@@ -1546,7 +1596,6 @@ async function fetchLatestSignature(workerId) {
   }
 }
 
-// Usado pelos exports oficiais (Word/Impressão), que já são assíncronos.
 async function workerSignatures(worker) {
   return fetchLatestSignature(worker.id);
 }
@@ -1555,8 +1604,6 @@ function invalidateSignatureCache(workerId) {
   delete state.workerSignatureCache[workerId];
 }
 
-// Usado pela linha do tempo (render síncrono): mostra o que estiver em cache
-// e, se ainda não houver nada, pede ao Firestore e volta a desenhar quando chegar.
 function cachedWorkerSignature(workerId) {
   if (state.workerSignatureCache[workerId] !== undefined) return state.workerSignatureCache[workerId];
   state.workerSignatureCache[workerId] = {};
@@ -1590,12 +1637,15 @@ async function exportWordOfficial() {
   }
   const rows = events.map(e => `
     <tr>
-      <td>${html(e.tipo === "AUDITORIA_GLOBAL" ? "INSPEÇÃO ANUAL" : epiLabel(e))}</td><td>${html(epiRiscos(e))}</td><td class="center">${e.qtd || "—"}</td>
+      <td>${html(e.tipo === "AUDITORIA_GLOBAL" ? "INSPEÇÃO ANUAL" : epiLabel(e))}</td>
+      <td>${html(epiRiscos(e))}</td>
+      <td class="center">${e.qtd || "—"}</td>
       <td class="center">${html(e.data)}</td>
-      <td class="center">${e.tipo === "ENTREGA" ? "Assinado no fundo" : "—"}</td>
-      <td class="center">${html(e.responsavel)}</td><td class="center">${fmtDate(e.validade)}</td>
+      <td class="center">${html(e.responsavel)}</td>
+      <td class="center">${fmtDate(e.validade)}</td>
       <td class="center">${e.tipo === "AUDITORIA_GLOBAL" ? html(e.estado) : ""}</td>
-    </tr>`).join("") || `<tr><td colspan="8" class="center">Sem entregas registadas.</td></tr>`;
+    </tr>`).join("") || `<tr><td colspan="7" class="center">Sem entregas registadas.</td></tr>`;
+
   const doc = `<!doctype html>
 <html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word" xmlns="http://www.w3.org/TR/REC-html40">
 <head><meta charset="utf-8"><title>IMP35.001</title>
@@ -1622,7 +1672,15 @@ h3{font-size:8pt;margin:5pt 0 2pt}
 </tr></table>
 <p class="legal">Declaro que recebi os Equipamentos de Proteção Individual abaixo indicados, tomei conhecimento das regras de utilização, conservação e devolução, no âmbito das obrigações previstas no Decreto-Lei 102/2009.</p>
 <table class="epi">
-<thead><tr><th style="width:24%">Designação do EPI</th><th style="width:16%">Riscos</th><th style="width:5%">QTD</th><th style="width:11%">Data</th><th style="width:12%">Rubrica</th><th style="width:13%">Resp. pela entrega</th><th style="width:10%">Validade</th><th style="width:9%">Devolução</th></tr></thead>
+<thead><tr>
+  <th style="width:28%">Designação do EPI</th>
+  <th style="width:18%">Riscos</th>
+  <th style="width:6%">QTD</th>
+  <th style="width:13%">Data</th>
+  <th style="width:15%">Resp. pela entrega</th>
+  <th style="width:12%">Validade</th>
+  <th style="width:8%">Devolução</th>
+</tr></thead>
 <tbody>${rows}</tbody>
 </table>
 <h3>Riscos a eliminar/minimizar</h3>
@@ -1632,13 +1690,12 @@ h3{font-size:8pt;margin:5pt 0 2pt}
 <td style="width:50%">Rubrica de quem entrega<br>${signatures.entregador ? `<img class="sign sign-footer" width="160" height="42" src="${signatures.entregador}">` : html(signatures.responsavel || "")}</td>
 </tr></table>
 </div></body></html>`;
+
   downloadTextFile(doc, `IMP35.001_${worker.nome.replace(/\s+/g, "_")}.doc`, "application/msword;charset=utf-8");
 }
 
 async function openPrintOfficial() {
   const worker = state.data.trabalhadores.find(w => w.id === state.selectedWorkerId);
-  // Abrir a janela já aqui (ainda dentro do clique do utilizador), antes do
-  // await, para o browser não bloquear o pop-up.
   const printWindow = window.open("", "_blank");
   if (!printWindow) { alert("O browser bloqueou a janela de impressão. Permita pop-ups e tente novamente."); return; }
   printWindow.document.write("<p style='font-family:sans-serif;padding:2rem;color:#555'>A preparar documento…</p>");
@@ -1652,12 +1709,15 @@ async function openPrintOfficial() {
   }
   const rows = events.map(e => `
     <tr>
-      <td>${html(e.tipo === "AUDITORIA_GLOBAL" ? "INSPEÇÃO ANUAL" : epiLabel(e))}</td><td>${html(epiRiscos(e))}</td><td class="center">${e.qtd || "—"}</td>
+      <td>${html(e.tipo === "AUDITORIA_GLOBAL" ? "INSPEÇÃO ANUAL" : epiLabel(e))}</td>
+      <td>${html(epiRiscos(e))}</td>
+      <td class="center">${e.qtd || "—"}</td>
       <td class="center">${html(e.data)}</td>
-      <td class="center rubrica">${e.tipo === "ENTREGA" ? "Assinado no fundo" : "—"}</td>
-      <td class="center">${html(e.responsavel)}</td><td class="center">${fmtDate(e.validade)}</td>
+      <td class="center">${html(e.responsavel)}</td>
+      <td class="center">${fmtDate(e.validade)}</td>
       <td class="center">${e.tipo === "AUDITORIA_GLOBAL" ? html(e.estado) : ""}</td>
-    </tr>`).join("") || `<tr><td colspan="8" class="center">Sem entregas registadas.</td></tr>`;
+    </tr>`).join("") || `<tr><td colspan="7" class="center">Sem entregas registadas.</td></tr>`;
+
   const doc = `<!doctype html>
 <html lang="pt-PT"><head><meta charset="utf-8"><title>IMP35.001 - ${html(worker.nome)}</title>
 <style>
@@ -1688,7 +1748,15 @@ h3{font-size:8pt;margin:5pt 0 2pt}
 </tr></table>
 <p class="legal">Declaro que recebi os Equipamentos de Proteção Individual abaixo indicados, tomei conhecimento das regras de utilização, conservação e devolução, no âmbito das obrigações previstas no Decreto-Lei 102/2009.</p>
 <table class="epi">
-<thead><tr><th style="width:24%">Designação do EPI</th><th style="width:16%">Riscos</th><th style="width:5%">QTD</th><th style="width:11%">Data</th><th style="width:12%">Rubrica</th><th style="width:13%">Resp. pela entrega</th><th style="width:10%">Validade</th><th style="width:9%">Devolução</th></tr></thead>
+<thead><tr>
+  <th style="width:28%">Designação do EPI</th>
+  <th style="width:18%">Riscos</th>
+  <th style="width:6%">QTD</th>
+  <th style="width:13%">Data</th>
+  <th style="width:15%">Resp. pela entrega</th>
+  <th style="width:12%">Validade</th>
+  <th style="width:8%">Devolução</th>
+</tr></thead>
 <tbody>${rows}</tbody>
 </table>
 <h3>Riscos a eliminar/minimizar</h3>
@@ -1700,6 +1768,7 @@ h3{font-size:8pt;margin:5pt 0 2pt}
 </div>
 <script>window.addEventListener("load",function(){setTimeout(function(){window.print();},250);});<\/script>
 </body></html>`;
+
   printWindow.document.open();
   printWindow.document.write(doc);
   printWindow.document.close();
@@ -1713,5 +1782,5 @@ function iconBell() { return `<svg viewBox="0 0 24 24" fill="none" stroke-width=
 function iconAudit() { return `<svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M9 11.5 11 13.5 15.5 9"/><path d="M12 3 4 6v6c0 5 3.5 8.5 8 9 4.5-.5 8-4 8-9V6l-8-3Z"/></svg>`; }
 
 // ─── Arranque ─────────────────────────────────────────────────────────────────
-renderLogin(); // mostra login imediatamente
-loadFromFirestore().then(() => subscribeRealtime()); // carrega dados e ativa sync em tempo real
+renderLogin();
+loadFromFirestore().then(() => subscribeRealtime());
