@@ -60,7 +60,7 @@ const MATRIZ_INICIAL = [
   ["FATO IMPERMEÁVEL", "6,11,13,15,16", 24],
   ["FATO TYVEK", "11", 1],
   ["ARNES + CORDAS + ABS ENERGIA", "1", 36]
-].map(([nome, riscos, meses]) => ({ nome, riscos, meses }));
+].map(([nome, riscos, meses]) => ({ nome, riscos, meses, preco: 0 }));
 
 // ─── DOM ─────────────────────────────────────────────────────────────────────
 const appEl = document.querySelector("#app");
@@ -72,7 +72,7 @@ const state = {
   operadorAtual: null,
   page: "home",
   selectedWorkerId: null,
-  filters: { workerSearch: "", delegacao: "TODAS", stockWarehouse: "DPM Norte" },
+  filters: { workerSearch: "", delegacao: "TODAS", stockWarehouse: "DPM Norte", auditEstado: "TODOS" },
   data: defaultData(),
   syncing: false,
   loaded: false,
@@ -191,6 +191,7 @@ function ensureDataShape() {
   }
   if (!state.data.operadores) state.data.operadores = [];
   if (!state.data.matriz) state.data.matriz = MATRIZ_INICIAL;
+  state.data.matriz.forEach(epi => { if (typeof epi.preco !== "number" || isNaN(epi.preco)) epi.preco = 0; });
   if (!state.data.trabalhadores) state.data.trabalhadores = [];
   if (!state.data.eventos) state.data.eventos = [];
   if (!state.data.latestSignatures) state.data.latestSignatures = {};
@@ -342,6 +343,25 @@ function budgetTotals() {
   return { limit, planned, spent, remaining: Math.max(0, limit - spent), pct: limit ? Math.min(100, Math.round((spent / limit) * 100)) : 0 };
 }
 
+// Custo em EPIs, calculado a partir das entregas reais (qtd × preço unitário
+// do artigo no matriz, o mesmo preço que está no armazém/compra) — não
+// depende de preencher nada à mão, cruza sempre com o que foi de facto entregue.
+function epiPreco(epiName) {
+  return Number(state.data.matriz.find(m => m.nome === epiName)?.preco || 0);
+}
+
+function workerEpiCost(workerId) {
+  return state.data.eventos
+    .filter(e => e.tipo === "ENTREGA" && e.idTrab === workerId)
+    .reduce((sum, e) => sum + epiPreco(e.epi) * Number(e.qtd || 0), 0);
+}
+
+function allWorkerCosts() {
+  return state.data.trabalhadores
+    .map(w => ({ worker: w, custo: workerEpiCost(w.id) }))
+    .sort((a, b) => b.custo - a.custo);
+}
+
 function todayISO() { return new Date().toISOString().slice(0, 10); }
 
 function addMonths(date, months) {
@@ -436,7 +456,7 @@ function render() {
   if (!state.user) return renderLogin();
   if (!isSuper() && !state.operadorAtual) return renderOperadorPicker();
   if (state.selectedWorkerId) return renderWorkerDetail();
-  const views = { home: renderHome, people: renderPeople, stock: renderStock, alerts: renderAlerts, audit: renderAudit };
+  const views = { home: renderHome, people: renderPeople, stock: renderStock, alerts: renderAlerts, audit: renderAudit, budget: renderBudget };
   appEl.innerHTML = `
     <main>
       <div class="app-top">
@@ -456,7 +476,7 @@ function render() {
 }
 
 function pageTitle() {
-  return { home: "Início", people: "Pessoal", stock: "Armazém", alerts: "Alertas", audit: "Auditoria" }[state.page];
+  return { home: "Início", people: "Pessoal", stock: "Armazém", alerts: "Alertas", audit: "Auditoria", budget: "Orçamento" }[state.page];
 }
 
 function renderOperadorPicker() {
@@ -527,6 +547,7 @@ function bottomNav() {
     ["alerts", iconBell(), "Alertas"],
     ["audit", iconAudit(), "Auditoria"]
   ];
+  if (isSuper()) items.push(["budget", iconBudget(), "Orçamento"]);
   return `<nav class="bottom-nav">${items.map(([id, icon, label]) => `
     <button class="nav-btn ${state.page === id ? "active" : ""}" data-page="${id}">
       ${id === "alerts" && count ? `<span class="nav-badge">${count}</span>` : ""}
@@ -552,7 +573,6 @@ function renderHome() {
         <div class="kpi"><span>A Expirar</span><strong>${warning.length}</strong></div>
       </div>
     </section>
-    ${renderBudgetCard()}
     ${isSuper() ? renderStockMatrix() : ""}
     <section class="section">
       <div class="section-head"><h2>Ações Rápidas</h2></div>
@@ -573,14 +593,19 @@ function renderHome() {
   `;
 }
 
-function renderBudgetCard() {
+function renderBudget() {
+  if (!isSuper()) {
+    return `<section class="section"><p class="empty">Acesso restrito ao SuperAdmin.</p></section>`;
+  }
   const totals = budgetTotals();
   const usedItems = Object.entries(state.data.budget.items || {})
     .filter(([, item]) => Number(item.planned || 0) || Number(item.spent || 0))
     .slice(0, 4);
+  const costs = allWorkerCosts();
+  const totalCusto = costs.reduce((sum, c) => sum + c.custo, 0);
   return `
     <section class="section">
-      <div class="section-head"><h2>Orçamento de Segurança</h2><button class="ghost-btn" data-modal="budget">Editar</button></div>
+      <div class="section-head"><h2>Orçamento de Segurança</h2><button class="ghost-btn" data-modal="budget">Editar Limite</button></div>
       <div class="budget-card">
         <div class="budget-row">
           <div><span>Limite Geral</span><strong>${money(totals.limit)}</strong></div>
@@ -592,6 +617,48 @@ function renderBudgetCard() {
         ${usedItems.length ? `<div class="budget-mini-list">${usedItems.map(([name, item]) => `
           <div><span>${html(name)}</span><strong>${money(Number(item.spent || 0))} / ${money(Number(item.planned || 0))}</strong></div>
         `).join("")}</div>` : ""}
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head"><h2>Preço dos Artigos EPI</h2></div>
+      <p class="meta">O preço de compra/armazém de cada artigo — usado para calcular o custo real por trabalhador, cruzando com as quantidades já entregues.</p>
+      <form data-form="precos">
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Artigo</th><th style="width:120px">Preço unitário (€)</th></tr></thead>
+            <tbody>
+              ${state.data.matriz.map(epi => `
+                <tr>
+                  <td>${html(epi.nome)}</td>
+                  <td><input class="input" data-preco-epi="${html(epi.nome)}" type="number" min="0" step="0.01" value="${Number(epi.preco || 0)}"></td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </div>
+        <button class="primary-btn" type="submit" style="margin-top:10px">Guardar Preços</button>
+      </form>
+    </section>
+
+    <section class="section">
+      <div class="section-head"><h2>Custo em EPIs por Trabalhador</h2><span class="badge blue">${money(totalCusto)}</span></div>
+      <p class="meta">Quantidade entregue a cada trabalhador × preço unitário do artigo — soma de todas as entregas registadas até hoje.</p>
+      <button class="ghost-btn" data-action="exportBudgetCsv">↓ Exportar (CSV)</button>
+      <div class="table-wrap" style="margin-top:10px">
+        <table>
+          <thead><tr><th>Trabalhador</th><th>Função</th><th>Delegação</th><th>Custo Total</th></tr></thead>
+          <tbody>
+            ${costs.map(c => `
+              <tr>
+                <td>${html(c.worker.nome)}</td>
+                <td>${html(c.worker.funcao)}</td>
+                <td>${html(c.worker.delegacao)}</td>
+                <td class="mono">${money(c.custo)}</td>
+              </tr>
+            `).join("") || `<tr><td colspan="4">Sem trabalhadores.</td></tr>`}
+          </tbody>
+        </table>
       </div>
     </section>
   `;
@@ -803,10 +870,17 @@ function auditRows() {
   const workers = scopedWorkers();
   const workerIds = new Set(workers.map(w => w.id));
   const workersById = Object.fromEntries(workers.map(w => [w.id, w]));
+  const rank = { expired: 0, warning: 1, normal: 2 }; // usado só na ordenação
   return state.data.eventos
     .filter(e => e.tipo === "ENTREGA" && workerIds.has(e.idTrab))
     .map(e => ({ ...e, worker: workersById[e.idTrab], status: eventStatus(e) }))
-    .sort((a, b) => (a.validade || "").localeCompare(b.validade || ""));
+    .sort((a, b) => {
+      // Mais urgente primeiro: expirado > a expirar > válido > substituído (baixa).
+      const ra = a.statusAlerta === "ATIVO" ? rank[a.status] : 3;
+      const rb = b.statusAlerta === "ATIVO" ? rank[b.status] : 3;
+      if (ra !== rb) return ra - rb;
+      return (a.validade || "").localeCompare(b.validade || "");
+    });
 }
 
 function auditSummary(rows) {
@@ -819,13 +893,35 @@ function auditSummary(rows) {
   const validos = ativos.filter(r => r.status === "normal");
   const workersComEntrega = new Set(rows.map(r => r.idTrab));
   const semNenhumaEntrega = workers.filter(w => !workersComEntrega.has(w.id));
-  return { ativos, semAssinatura, desconhecida, expirados, aExpirar, validos, semNenhumaEntrega, workers };
+  const porDelegacao = WAREHOUSES.map(d => {
+    const dAtivos = ativos.filter(r => r.worker?.delegacao === d);
+    return {
+      delegacao: d,
+      total: dAtivos.length,
+      expirados: dAtivos.filter(r => r.status === "expired").length,
+      aExpirar: dAtivos.filter(r => r.status === "warning").length,
+      semAssinatura: dAtivos.filter(r => r.assinado === false).length
+    };
+  });
+  return { ativos, semAssinatura, desconhecida, expirados, aExpirar, validos, semNenhumaEntrega, workers, porDelegacao };
 }
 
 function renderAudit() {
-  const rows = auditRows();
-  const s = auditSummary(rows);
+  const allRows = auditRows();
+  const s = auditSummary(allRows);
   const conformidade = s.ativos.length ? Math.round((s.validos.length / s.ativos.length) * 100) : 100;
+  const delegacoesFiltro = isSuper() ? ["TODAS", ...WAREHOUSES] : [state.user.armazem];
+  const estados = ["TODOS", "expired", "warning", "normal", "semAssinatura", "baixa"];
+  const estadoLabel = { TODOS: "Todos os estados", expired: "Expirados", warning: "A expirar", normal: "Válidos", semAssinatura: "Sem assinatura", baixa: "Substituídas (baixa)" };
+  const rows = allRows.filter(r => {
+    const okDelegacao = state.filters.delegacao === "TODAS" || r.worker?.delegacao === state.filters.delegacao;
+    if (!okDelegacao) return false;
+    const est = state.filters.auditEstado;
+    if (est === "TODOS") return true;
+    if (est === "semAssinatura") return r.statusAlerta === "ATIVO" && r.assinado === false;
+    if (est === "baixa") return r.statusAlerta !== "ATIVO";
+    return r.statusAlerta === "ATIVO" && r.status === est;
+  });
   return `
     <section class="section">
       <div class="section-head"><h2>Estado de Conformidade</h2></div>
@@ -840,8 +936,26 @@ function renderAudit() {
       <p class="meta">Taxa de conformidade (entregas ativas dentro da validade): <strong>${conformidade}%</strong>.
         As assinaturas e o registo completo de cada entrega ficam gravados de forma imutável na coleção
         <span class="mono">deliveries</span> do Firestore — a app nunca edita nem apaga esses documentos, só acrescenta.</p>
-      <button class="primary-btn" data-action="exportAuditCsv">↓ Exportar Auditoria (CSV)</button>
+      <button class="primary-btn" data-action="exportAuditCsv">↓ Exportar Auditoria Completa (CSV)</button>
     </section>
+
+    ${isSuper() ? `
+    <section class="section">
+      <div class="section-head"><h2>Por Delegação</h2></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Delegação</th><th>Ativas</th><th>Expiradas</th><th>A expirar</th><th>Sem assinatura</th></tr></thead>
+          <tbody>${s.porDelegacao.map(d => `
+            <tr>
+              <td>${html(d.delegacao)}</td><td class="mono">${d.total}</td>
+              <td class="mono">${d.expirados ? `<span class="badge danger">${d.expirados}</span>` : "0"}</td>
+              <td class="mono">${d.aExpirar ? `<span class="badge warn">${d.aExpirar}</span>` : "0"}</td>
+              <td class="mono">${d.semAssinatura ? `<span class="badge danger">${d.semAssinatura}</span>` : "0"}</td>
+            </tr>
+          `).join("")}</tbody>
+        </table>
+      </div>
+    </section>` : ""}
 
     ${s.semNenhumaEntrega.length ? `
     <section class="section">
@@ -851,13 +965,29 @@ function renderAudit() {
       `).join("")}</div>
     </section>` : ""}
 
+    ${s.semAssinatura.length ? `
     <section class="section">
-      <div class="section-head"><h2>Registo Completo</h2><span class="badge blue">${rows.length}</span></div>
+      <div class="section-head"><h2>Entregas ativas sem assinatura</h2><span class="badge danger">${s.semAssinatura.length}</span></div>
+      <div class="alert-list">${s.semAssinatura.map(r => `
+        <div class="alert-card"><div><strong>${html(r.worker?.nome || "—")}</strong><span class="meta">${html(epiLabel(r))} · ${html(r.data)} · ${html(r.responsavel)}</span></div></div>
+      `).join("")}</div>
+    </section>` : ""}
+
+    <section class="section">
+      <div class="section-head"><h2>Registo Completo</h2><span class="badge blue">${rows.length} de ${allRows.length}</span></div>
+      <div class="field-row two">
+        <select class="select" data-filter="delegacao" ${isSuper() ? "" : "disabled"}>
+          ${delegacoesFiltro.map(d => `<option ${state.filters.delegacao === d ? "selected" : ""}>${d}</option>`).join("")}
+        </select>
+        <select class="select" data-filter="auditEstado">
+          ${estados.map(e => `<option value="${e}" ${state.filters.auditEstado === e ? "selected" : ""}>${estadoLabel[e]}</option>`).join("")}
+        </select>
+      </div>
       <div class="table-wrap">
         <table>
           <thead><tr><th>Trabalhador</th><th>EPI</th><th>Data</th><th>Validade</th><th>Estado</th><th>Assinatura</th><th>Responsável</th></tr></thead>
           <tbody>
-            ${rows.map(auditRow).join("") || `<tr><td colspan="7">Sem entregas registadas.</td></tr>`}
+            ${rows.map(auditRow).join("") || `<tr><td colspan="7">Sem entregas neste filtro.</td></tr>`}
           </tbody>
         </table>
       </div>
@@ -897,6 +1027,17 @@ function exportAuditCsv() {
     ].map(v => `"${String(v ?? "").replace(/"/g, '""')}"`).join(";"));
   });
   downloadTextFile("\uFEFF" + csvLines.join("\r\n"), `auditoria-epi-${todayISO()}.csv`, "text/csv;charset=utf-8");
+}
+
+function exportBudgetCsv() {
+  const costs = allWorkerCosts();
+  const header = ["Trabalhador", "Função", "Delegação", "Custo Total EPIs (€)"];
+  const csvLines = [header.join(";")];
+  costs.forEach(c => {
+    csvLines.push([c.worker.nome, c.worker.funcao, c.worker.delegacao, c.custo.toFixed(2)]
+      .map(v => `"${String(v ?? "").replace(/"/g, '""')}"`).join(";"));
+  });
+  downloadTextFile("\uFEFF" + csvLines.join("\r\n"), `custo-epis-por-trabalhador-${todayISO()}.csv`, "text/csv;charset=utf-8");
 }
 
 // ─── Modals ───────────────────────────────────────────────────────────────────
@@ -989,6 +1130,7 @@ function articleModal() {
       <div class="field-row"><input class="input" name="nome" placeholder="Designação" required></div>
       <div class="field-row"><input class="input" name="riscos" placeholder="Códigos de risco, ex: 6,11,13" required></div>
       <div class="field-row"><input class="input" name="meses" type="number" min="1" placeholder="Meses de validade padrão" required></div>
+      <div class="field-row"><input class="input" name="preco" type="number" min="0" step="0.01" placeholder="Preço unitário (€) — opcional, editável depois"></div>
       <button class="primary-btn" type="submit">Adicionar à Matriz</button>
     </form>
   `);
@@ -1408,6 +1550,7 @@ function handleAction(action, target = null) {
   if (action === "removeDeliveryItem") removeDeliveryItem(target);
   if (action === "migrateSignatures") migrateLegacySignatures();
   if (action === "exportAuditCsv") exportAuditCsv();
+  if (action === "exportBudgetCsv") exportBudgetCsv();
   if (action === "archiveOldEvents") archiveOldEvents();
 }
 
@@ -1484,7 +1627,7 @@ document.addEventListener("submit", async ev => {
     await saveAll(); closeModal(); render();
   }
   if (kind === "article") {
-    const epi = { nome: form.nome.value.trim().toUpperCase(), riscos: form.riscos.value.trim(), meses: Number(form.meses.value) };
+    const epi = { nome: form.nome.value.trim().toUpperCase(), riscos: form.riscos.value.trim(), meses: Number(form.meses.value), preco: Math.max(0, Number(form.preco.value) || 0) };
     state.data.matriz.push(epi);
     WAREHOUSES.forEach(w => { state.data.stocks[w][epi.nome] = { loose: 0, sizes: {} }; });
     await saveAll(); closeModal(); render();
@@ -1496,6 +1639,7 @@ document.addEventListener("submit", async ev => {
     await saveAll(); closeModal(); render();
   }
   if (kind === "budget") {
+    if (!isSuper()) return;
     const items = {};
     state.data.matriz.forEach((epi, i) => {
       const planned = Number(form[`planned_${i}`]?.value || 0);
@@ -1504,6 +1648,16 @@ document.addEventListener("submit", async ev => {
     });
     state.data.budget = { limit: Number(form.limit.value || 0), items };
     await saveAll(); closeModal(); render();
+  }
+  if (kind === "precos") {
+    if (!isSuper()) return;
+    form.querySelectorAll("[data-preco-epi]").forEach(input => {
+      const epi = state.data.matriz.find(m => m.nome === input.dataset.precoEpi);
+      if (epi) epi.preco = Math.max(0, Number(input.value) || 0);
+    });
+    await saveAll();
+    showToast("Preços guardados.");
+    render();
   }
 });
 
@@ -1780,6 +1934,7 @@ function iconUsers() { return `<svg viewBox="0 0 24 24" fill="none" stroke-width
 function iconBox() { return `<svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="m21 8-9-5-9 5 9 5 9-5Z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/></svg>`; }
 function iconBell() { return `<svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>`; }
 function iconAudit() { return `<svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M9 11.5 11 13.5 15.5 9"/><path d="M12 3 4 6v6c0 5 3.5 8.5 8 9 4.5-.5 8-4 8-9V6l-8-3Z"/></svg>`; }
+function iconBudget() { return `<svg viewBox="0 0 24 24" fill="none" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v10M9.5 9.5c0-1.4 1.2-2.5 2.5-2.5s2.5.8 2.5 2c0 2-5 1.5-5 3.5 0 1.2 1.2 2 2.5 2s2.5-1.1 2.5-2.5"/></svg>`; }
 
 // ─── Arranque ─────────────────────────────────────────────────────────────────
 renderLogin();
